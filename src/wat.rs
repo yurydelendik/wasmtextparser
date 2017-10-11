@@ -12,6 +12,8 @@ pub struct WatParserError {
 
 pub type Result<T> = result::Result<T, WatParserError>;
 
+pub type Keyword = Vec<u8>;
+pub type Data = Vec<u8>;
 pub type ID = Vec<u8>;
 pub type OptionalID = Option<ID>;
 pub type Name = String;
@@ -56,6 +58,22 @@ pub struct WatResult {
 pub struct WatLocal {
     pub id: OptionalID,
     pub valtype: WatValType,
+}
+
+#[derive(Debug,Clone)]
+pub enum WatFloat {
+    Number(bool, Data, i32),
+    NaN(bool, Option<Data>),
+    Inf(bool),
+}
+
+#[derive(Debug)]
+pub enum WatInstructionArg {
+    ID(ID),
+    Unsigned(Data),
+    Signed(bool, Data),
+    Float(WatFloat),
+    Flags(Keyword, u32),
 }
 
 #[derive(Debug)]
@@ -163,7 +181,12 @@ pub enum WatParserState {
         locals: Vec<WatLocal>,
     },
     EndFunc,
-    CodeOperator { group: bool, position: WatPosition },
+    CodeOperator {
+        instruction: Keyword,
+        args: Vec<WatInstructionArg>,
+        group: bool,
+        position: WatPosition,
+    },
     CodeOperatorEnd,
 }
 
@@ -282,15 +305,17 @@ impl<'a> WatParser<'a> {
         }
     }
 
-    fn get_keyword(&self) -> &[u8] {
-        assert!(self.is_keyword());
-        return self.current_token_content();
+    fn get_keyword(&self) -> Result<&[u8]> {
+        if self.is_keyword() {
+            return Ok(self.current_token_content());
+        }
+        Err(self.create_error("a keyword is expected"))
     }
 
-    fn is_memarg_flag(&self) -> bool {
-        let content = self.get_keyword();
-        content.len() > 7 && &content[..7] == b"offset=" ||
-        content.len() > 6 && &content[..6] == b"flags="
+    fn is_memarg_flag(&self) -> Result<bool> {
+        let content = self.get_keyword()?;
+        Ok(content.len() > 7 && &content[..7] == b"offset=" ||
+           content.len() > 6 && &content[..6] == b"flags=")
     }
 
     fn maybe_id(&mut self) -> Result<OptionalID> {
@@ -300,6 +325,14 @@ impl<'a> WatParser<'a> {
             return Ok(Some(id));
         }
         Ok(None)
+    }
+
+    fn read_id(&mut self) -> Result<ID> {
+        let id = self.maybe_id()?;
+        if id.is_some() {
+            return Ok(id.unwrap());
+        }
+        Err(self.create_error("id is expected"))
     }
 
     fn read_u32(&mut self) -> Result<u32> {
@@ -327,6 +360,15 @@ impl<'a> WatParser<'a> {
         unreachable!();
     }
 
+    fn read_keyword(&mut self) -> Result<Keyword> {
+        if let WatTokenType::Keyword = *self.current_token_type() {
+            let keyword = Vec::from(self.current_token_content());
+            self.advance()?;
+            return Ok(keyword);
+        }
+        unreachable!();
+    }
+
     fn read_limits(&mut self) -> Result<WatLimits> {
         let min = self.read_u32()?;
         let max = if let WatTokenType::Unsigned = *self.current_token_type() {
@@ -338,21 +380,20 @@ impl<'a> WatParser<'a> {
     }
 
     fn read_memtype(&mut self) -> Result<WatMemoryType> {
-        if !self.maybe_open_paren()? {
+        if self.maybe_open_paren()? {
+            self.expect_exact_keyword(b"shared")?;
             let limits = self.read_limits()?;
+            self.expect_close_paren()?;
             return Ok(WatMemoryType {
                           limits,
-                          shared: false,
+                          shared: true,
                       });
         }
-        let shared = match self.get_keyword() {
-            b"shared" => true,
-            _ => unimplemented!("nyi"),
-        };
-        self.advance()?;
         let limits = self.read_limits()?;
-        self.expect_close_paren()?;
-        Ok(WatMemoryType { limits, shared })
+        Ok(WatMemoryType {
+               limits,
+               shared: false,
+           })
     }
 
     fn read_start_module(&mut self) -> Result<()> {
@@ -376,7 +417,7 @@ impl<'a> WatParser<'a> {
         let modname = self.read_name()?;
         let fieldname = self.read_name()?;
         self.expect_open_paren()?;
-        let keyword = match self.get_keyword() {
+        let keyword = match self.get_keyword()? {
             b"memory" => KnownKeyword::Memory,
             _ => unimplemented!("nyi"),
         };
@@ -396,7 +437,7 @@ impl<'a> WatParser<'a> {
     }
 
     fn read_valtype(&mut self) -> Result<WatValType> {
-        let valtype = match self.get_keyword() {
+        let valtype = match self.get_keyword()? {
             b"i32" => WatValType::I32,
             b"f64" => WatValType::I64,
             b"f32" => WatValType::F32,
@@ -560,6 +601,31 @@ impl<'a> WatParser<'a> {
         Ok(())
     }
 
+    fn read_memarg_flag(&mut self) -> Result<WatInstructionArg> {
+        let keyword = self.read_keyword()?;
+        Ok(WatInstructionArg::Flags(keyword, 0)) // FIXME
+    }
+
+    fn read_arg_id(&mut self) -> Result<WatInstructionArg> {
+        let id = self.read_id()?;
+        Ok(WatInstructionArg::ID(id))
+    }
+
+    fn read_arg_signed(&mut self) -> Result<WatInstructionArg> {
+        self.advance()?;
+        Ok(WatInstructionArg::Signed(false, vec![])) // FIXME
+    }
+
+    fn read_arg_unsigned(&mut self) -> Result<WatInstructionArg> {
+        self.advance()?;
+        Ok(WatInstructionArg::Unsigned(vec![])) // FIXME
+    }
+
+    fn read_arg_float(&mut self) -> Result<WatInstructionArg> {
+        self.advance()?;
+        Ok(WatInstructionArg::Float(WatFloat::Number(false, vec![], 0))) // FIXME
+    }
+
     fn read_func_body(&mut self) -> Result<()> {
         if self.maybe_close_paren()? {
             if self.func_depth.unwrap() == 0 {
@@ -576,16 +642,15 @@ impl<'a> WatParser<'a> {
         } else {
             false
         };
-        if !self.is_keyword() {
-            return Err(self.create_error("a keyword is expected for instruction"));
-        }
         let position = self.current_token().start;
+        let instruction = self.read_keyword()?;
+        let mut args = Vec::new();
         'main: loop {
-            self.advance()?;
             match *self.current_token_type() {
                 WatTokenType::End => break,
                 WatTokenType::Keyword => {
-                    if self.is_memarg_flag() {
+                    if self.is_memarg_flag()? {
+                        args.push(self.read_memarg_flag()?);
                         continue;
                     }
                     break 'main;
@@ -593,8 +658,18 @@ impl<'a> WatParser<'a> {
                 WatTokenType::OpenParen | WatTokenType::CloseParen => {
                     break 'main;
                 }
-                WatTokenType::ID | WatTokenType::Signed | WatTokenType::Unsigned |
-                WatTokenType::Float => (),
+                WatTokenType::ID => {
+                    args.push(self.read_arg_id()?);
+                }
+                WatTokenType::Signed => {
+                    args.push(self.read_arg_signed()?);
+                }
+                WatTokenType::Unsigned => {
+                    args.push(self.read_arg_unsigned()?);
+                }
+                WatTokenType::Float => {
+                    args.push(self.read_arg_float()?);
+                }
                 _ => {
                     return Err(self.create_error("unexpected token in the instruction"));
                 }
@@ -603,7 +678,12 @@ impl<'a> WatParser<'a> {
         if group {
             self.func_depth = Some(self.func_depth.unwrap() + 1);
         }
-        self.state = WatParserState::CodeOperator { group, position };
+        self.state = WatParserState::CodeOperator {
+            instruction,
+            args,
+            group,
+            position,
+        };
         Ok(())
     }
 
@@ -613,7 +693,7 @@ impl<'a> WatParser<'a> {
             return Ok(());
         }
         self.expect_open_paren()?;
-        let keyword = match self.get_keyword() {
+        let keyword = match self.get_keyword()? {
             b"import" => KnownKeyword::Import,
             b"func" => KnownKeyword::Func,
             _ => unreachable!("nyi"),
