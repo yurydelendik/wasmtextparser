@@ -60,18 +60,24 @@ pub struct WatLocal {
     pub valtype: WatValType,
 }
 
+#[derive(Debug,Clone,Copy)]
+pub enum WatSign {
+    Positive,
+    Negative,
+}
+
 #[derive(Debug,Clone)]
 pub enum WatFloat {
-    Number(bool, Data, i32),
-    NaN(bool, Option<Data>),
-    Inf(bool),
+    Number(WatSign, Data, i32),
+    NaN(WatSign, Option<Data>),
+    Inf(WatSign),
 }
 
 #[derive(Debug)]
 pub enum WatInstructionArg {
     ID(ID),
     Unsigned(Data),
-    Signed(bool, Data),
+    Signed(WatSign, Data),
     Float(WatFloat),
     Flags(Keyword, u32),
 }
@@ -115,8 +121,61 @@ pub enum WatImport {
     },
 }
 
-fn parse_hexnum(bytes: &[u8]) -> u32 {
-    u32::from_str_radix(str::from_utf8(bytes).unwrap(), 16).unwrap()
+fn parse_hexnum_u32(bytes: &[u8]) -> Option<u32> {
+    // FIXME '_'?
+    let num = str::from_utf8(bytes);
+    if num.is_err() {
+        return None;
+    }
+    u32::from_str_radix(num.unwrap(), 16).ok()
+}
+
+fn parse_u32(bytes: &[u8]) -> Option<u32> {
+    if bytes.len() > 2 && bytes[0] == b'0' && bytes[0] == b'x' {
+        return parse_hexnum_u32(&bytes[2..]);
+    }
+    let num = str::from_utf8(bytes);
+    if num.is_err() {
+        return None;
+    }
+    num.unwrap().parse::<u32>().ok()
+}
+
+fn convert_u32_to_data(maybe_num: Option<u32>) -> Option<Data> {
+    if maybe_num.is_none() {
+        return None;
+    }
+    let mut result = Vec::new();
+    let mut num = maybe_num.unwrap();
+    result.push((num & 0xFF) as u8);
+    while num >= 0x100 {
+        num >>= 8;
+        result.push((num & 0xFF) as u8);
+    }
+    Some(result)
+}
+
+fn parse_hexnum(bytes: &[u8]) -> Option<Data> {
+    assert!(bytes.len() > 0);
+    if bytes.len() <= 8 {
+        return convert_u32_to_data(parse_hexnum_u32(bytes));
+    }
+    unimplemented!(); // FIXME
+}
+
+fn parse_num(bytes: &[u8]) -> Option<Data> {
+    if bytes.len() > 2 && bytes[0] == b'0' && bytes[0] == b'x' {
+        return parse_hexnum(&bytes[2..]);
+    }
+    assert!(bytes.len() > 0);
+    if bytes.len() <= 9 {
+        return convert_u32_to_data(parse_u32(bytes));
+    }
+    unimplemented!(); // FIXME
+}
+
+fn parse_float(bytes: &[u8]) -> Option<(WatSign, Data, i32)> {
+    Some((WatSign::Positive, vec![], 0)) // FIXME
 }
 
 fn parse_string(bytes: &[u8]) -> String {
@@ -149,7 +208,8 @@ fn parse_string(bytes: &[u8]) -> String {
                 while bytes[i] != b'}' {
                     i += 1;
                 }
-                let code = char::from_u32(parse_hexnum(&bytes[j..i])).unwrap();
+                let hexnum = parse_hexnum_u32(&bytes[j..i]).unwrap(); // FIXME
+                let code = char::from_u32(hexnum).unwrap(); // FIXME
                 let mut buffer = [0; 5];
                 let code_bytes = code.encode_utf8(&mut buffer).as_bytes();
                 result.extend_from_slice(&code_bytes);
@@ -338,9 +398,8 @@ impl<'a> WatParser<'a> {
     fn read_u32(&mut self) -> Result<u32> {
         if let WatTokenType::Unsigned = *self.current_token_type() {
             let result = {
-                let num = str::from_utf8(self.current_token_content()).unwrap();
-                let result = num.parse::<u32>();
-                if result.is_err() {
+                let result = parse_u32(self.current_token_content());
+                if result.is_none() {
                     return Err(self.create_error("unable to read u32"));
                 }
                 result.unwrap()
@@ -612,18 +671,41 @@ impl<'a> WatParser<'a> {
     }
 
     fn read_arg_signed(&mut self) -> Result<WatInstructionArg> {
+        let (sign, data) = {
+            let signed = self.current_token_content();
+            assert!(signed[0] == b'-' || signed[0] == b'+');
+            let sign = match signed[0] {
+                b'-' => WatSign::Negative,
+                b'+' => WatSign::Positive,
+                _ => unreachable!(),
+            };
+            let data = parse_num(&signed[1..]);
+            (sign, data)
+        };
+        if data.is_none() {
+            return Err(self.create_error("Unable to parse signed"));
+        }
         self.advance()?;
-        Ok(WatInstructionArg::Signed(false, vec![])) // FIXME
+        Ok(WatInstructionArg::Signed(sign, data.unwrap()))
     }
 
     fn read_arg_unsigned(&mut self) -> Result<WatInstructionArg> {
+        let data = parse_num(self.current_token_content());
+        if data.is_none() {
+            return Err(self.create_error("Unable to parse unsigned"));
+        }
         self.advance()?;
-        Ok(WatInstructionArg::Unsigned(vec![])) // FIXME
+        Ok(WatInstructionArg::Unsigned(data.unwrap()))
     }
 
     fn read_arg_float(&mut self) -> Result<WatInstructionArg> {
+        let result = parse_float(self.current_token_content());
+        if result.is_none() {
+            return Err(self.create_error("Unable to parse float"));
+        }
         self.advance()?;
-        Ok(WatInstructionArg::Float(WatFloat::Number(false, vec![], 0))) // FIXME
+        let (sign, data, power) = result.unwrap();
+        Ok(WatInstructionArg::Float(WatFloat::Number(sign, data, power)))
     }
 
     fn read_func_body(&mut self) -> Result<()> {
